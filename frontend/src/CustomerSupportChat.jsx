@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Headphones, LoaderCircle, MessageCircle, Send, ShieldCheck, X } from "lucide-react";
 import { Localized } from "./i18n.js";
-import { API_BASE } from "./api.js";
+import { API_URL } from "./api.js";
 
 const NAME_KEY = "electromart-support-name";
 const CLIENT_ID_KEY = "electromart-support-client-id";
@@ -88,7 +88,7 @@ export default function CustomerSupportChat() {
       requestInProgress.current = true;
       if (initial) setLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/api/chat`, {
+        const response = await fetch(`${API_URL}/api/chat`, {
           headers: { "X-Chat-Session-ID": clientId },
         });
         if (!response.ok) throw new Error(`Ошибка сервера (${response.status}).`);
@@ -145,7 +145,7 @@ export default function CustomerSupportChat() {
     }
     setSending(true);
     try {
-      const response = await fetch(`${API_BASE}/api/chat`, {
+      const response = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sender: "client", client_name: name, client_id: clientId, message: text }),

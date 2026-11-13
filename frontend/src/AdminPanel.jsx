@@ -27,7 +27,7 @@ import {
   X,
 } from "lucide-react";
 import { Localized, currencyLabel, formatPrice, priceFromCurrency, priceInCurrency } from "./i18n.js";
-import { API_BASE } from "./api.js";
+import { API_URL } from "./api.js";
 
 const CATEGORIES = [
   "Холодильники",
@@ -48,13 +48,13 @@ const getLocale = () => {
 async function requestJson(path, options = {}, adminToken = "", onUnauthorized = () => {}) {
   const headers = new Headers(options.headers || {});
   headers.set("X-Admin-Token", adminToken);
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const response = await fetch(`${API_URL}${path}`, { ...options, headers });
   const contentType = response.headers.get("content-type") || "";
   const body = contentType.includes("application/json")
     ? await response.json()
     : await response.text();
   if (!response.ok) {
-    if (response.status === 401) onUnauthorized();
+    if (response.status === 401 || response.status === 403) onUnauthorized();
     const detail = typeof body === "object" ? body?.detail : body;
     throw new Error(detail || `Ошибка сервера (${response.status}).`);
   }
@@ -134,7 +134,7 @@ function AdminPanel({
   onLogout,
 }) {
   const [activeTab, setActiveTab] = useState("products");
-  const [products, setProducts] = useState(initialProducts);
+  const [products, setProducts] = useState(Array.isArray(initialProducts) ? initialProducts.filter(Boolean) : []);
   const [orders, setOrders] = useState([]);
   const [promotions, setPromotions] = useState([]);
   const [news, setNews] = useState([]);
@@ -200,7 +200,7 @@ function AdminPanel({
   }, [adminRequest, onNewsChange, onPromotionsChange]);
 
   useEffect(() => {
-    setProducts(initialProducts);
+    setProducts(Array.isArray(initialProducts) ? initialProducts.filter(Boolean) : []);
   }, [initialProducts]);
 
   useEffect(() => {
@@ -277,27 +277,32 @@ function AdminPanel({
 
   const filteredProducts = useMemo(() => {
     const query = productSearch.trim().toLocaleLowerCase("ru");
-    return products.filter((product) => {
+    return (Array.isArray(products) ? products : []).filter((product) => {
+      if (!product) return false;
       const matchesCategory = !productCategory || product.category === productCategory;
       const text = `${product.name} ${product.brand} ${product.sku}`.toLocaleLowerCase("ru");
       return matchesCategory && (!query || text.includes(query));
     });
   }, [productCategory, productSearch, products]);
-  const unreadMessages = messages.filter((message) => message.sender === "client" && !message.is_read);
-  const activePromotionsCount = promotions.filter((promotion) => {
+  const safeOrders = Array.isArray(orders) ? orders.filter(Boolean) : [];
+  const safePromotions = Array.isArray(promotions) ? promotions.filter(Boolean) : [];
+  const safeNews = Array.isArray(news) ? news.filter(Boolean) : [];
+  const safeMessages = Array.isArray(messages) ? messages.filter(Boolean) : [];
+  const unreadMessages = safeMessages.filter((message) => message.sender === "client" && !message.is_read);
+  const activePromotionsCount = safePromotions.filter((promotion) => {
     const end = new Date(/^\d{4}-\d{2}-\d{2}$/.test(promotion.end_date) ? `${promotion.end_date}T23:59:59` : promotion.end_date);
     return !Number.isNaN(end.getTime()) && end.getTime() >= Date.now();
   }).length;
-  const revenue = orders.reduce((sum, order) => sum + (Number(order.total_price) || 0), 0);
-  const selectedClientMessages = messages.filter((message) => chatClientKey(message) === activeClient);
+  const revenue = safeOrders.reduce((sum, order) => sum + (Number(order.total_price) || 0), 0);
+  const selectedClientMessages = safeMessages.filter((message) => chatClientKey(message) === activeClient);
 
   useEffect(() => {
-    const clients = [...new Set(messages.map(chatClientKey))];
+    const clients = [...new Set(safeMessages.map(chatClientKey))];
     if (!activeClient || !clients.includes(activeClient)) {
       const unreadClient = unreadMessages[0] ? chatClientKey(unreadMessages[0]) : "";
       setActiveClient(unreadClient || clients.at(-1) || "");
     }
-  }, [activeClient, messages, unreadMessages]);
+  }, [activeClient, safeMessages, unreadMessages]);
 
   function updateProductDraft(productId, field, value) {
     if (field === "price") {
@@ -396,10 +401,10 @@ function AdminPanel({
   async function exportSpreadsheet() {
     setExporting(true);
     try {
-      const response = await fetch(`${API_BASE}/api/products/export-excel`, {
+      const response = await fetch(`${API_URL}/api/products/export-excel`, {
         headers: { "X-Admin-Token": adminToken },
       });
-      if (response.status === 401) onUnauthorized();
+      if (response.status === 401 || response.status === 403) onUnauthorized();
       if (!response.ok) {
         const contentType = response.headers.get("content-type") || "";
         const body = contentType.includes("application/json")
@@ -675,7 +680,7 @@ function AdminPanel({
               {uploading ? "Загрузка файла…" : "Загрузить товары из Excel (.xlsx / .xls)"}
             </button>
             <div className="excel-divider" />
-            <a className="excel-download-button" href={`${API_BASE}/api/products/template-excel`} download>
+            <a className="excel-download-button" href={`${API_URL}/api/products/template-excel`} download>
               <ArrowDownToLine size={15} /> Скачать шаблон Excel
             </a>
             <button className="excel-download-button excel-export-button" onClick={exportSpreadsheet} disabled={exporting}>
@@ -755,7 +760,7 @@ function AdminPanel({
                   <th>Заказ</th><th>Покупатель</th><th>Товары</th><th>Сумма</th><th>Дата</th><th>Статус</th>
                 </tr></thead>
                 <tbody>
-                  {[...orders].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).map((order) => {
+                  {[...safeOrders].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).map((order) => {
                     const items = parseOrderItems(order.items_json);
                     return (
                       <tr key={order.id}>
@@ -793,7 +798,7 @@ function AdminPanel({
             </form>
             <div className="content-list-heading"><strong>Опубликованные акции</strong><span>{promotions.length}</span></div>
             <div className="managed-content-list">
-              {promotions.map((promotion) => (
+              {safePromotions.map((promotion) => (
                 <div className="managed-content-item" key={promotion.id}>
                   <span className="promotion-color-chip" style={{ background: promotion.banner_color || "#3265df" }} />
                   <span className="managed-content-copy"><strong>{promotion.title}</strong><small>{promotion.discount_text} · до {promotion.end_date}</small></span>
@@ -820,7 +825,7 @@ function AdminPanel({
             </form>
             <div className="content-list-heading"><strong>Опубликованные статьи</strong><span>{news.length}</span></div>
             <div className="managed-content-list">
-              {news.map((article) => (
+              {safeNews.map((article) => (
                 <div className="managed-content-item" key={article.id}>
                   <span className="managed-news-icon"><Newspaper size={15} /></span>
                   <span className="managed-content-copy"><strong>{article.title}</strong><small>{article.date} · {article.summary}</small></span>
@@ -856,8 +861,8 @@ function AdminPanel({
           {messages.length === 0 ? <AdminEmpty icon={Mail} title="Сообщений пока нет" detail="Сообщения покупателей появятся в этом списке." /> : (
             <div className="support-layout">
               <div className="support-client-list">
-                {[...new Set(messages.map(chatClientKey))].map((client) => {
-                  const clientMessages = messages.filter((message) => chatClientKey(message) === client);
+                {[...new Set(safeMessages.map(chatClientKey))].map((client) => {
+                  const clientMessages = safeMessages.filter((message) => chatClientKey(message) === client);
                   const clientUnread = clientMessages.filter((message) => message.sender === "client" && !message.is_read).length;
                   const lastMessage = clientMessages.at(-1);
                   const clientName = clientMessages[0]?.client_name || "Покупатель";

@@ -1,6 +1,7 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import AdminPanel from "./AdminPanel.jsx";
 import CustomerSupportChat from "./CustomerSupportChat.jsx";
+import ProfilePage from "./ProfilePage.jsx";
 import PwaInstallButton from "./PwaInstallButton.jsx";
 import {
   LanguageContext,
@@ -15,7 +16,7 @@ import {
   priceInCurrency,
   translate,
 } from "./i18n.js";
-import { API_BASE } from "./api.js";
+import { API_URL } from "./api.js";
 import {
   ArrowDownWideNarrow,
   ArrowRight,
@@ -51,6 +52,39 @@ const PAGE_SIZE = 12;
 function safeNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
+}
+
+function readStoredCart() {
+  try {
+    const stored = window.localStorage.getItem("electromart_cart");
+    if (!stored) return {};
+    const parsed = JSON.parse(stored);
+    const entries = Array.isArray(parsed)
+      ? parsed.map((item) => [item?.product_id ?? item?.id, item?.quantity])
+      : Object.entries(parsed || {});
+    return Object.fromEntries(
+      entries
+        .map(([id, quantity]) => [String(id), Math.floor(Number(quantity))])
+        .filter(([id, quantity]) => /^\d+$/.test(id) && Number(id) > 0 && Number.isInteger(quantity) && quantity > 0),
+    );
+  } catch (error) {
+    console.error("Не удалось восстановить корзину из локального хранилища:", error);
+    return {};
+  }
+}
+
+function readStoredCartOwner() {
+  try {
+    const storedOwner = window.localStorage.getItem("electromart_cart_user_id");
+    if (storedOwner) return storedOwner;
+    if (window.localStorage.getItem("electromart_user_token")) {
+      const savedUser = JSON.parse(window.localStorage.getItem("electromart_user") || "null");
+      return savedUser?.id ? String(savedUser.id) : "";
+    }
+  } catch (error) {
+    console.error("Не удалось восстановить владельца сохранённой корзины:", error);
+  }
+  return "";
 }
 
 const CATEGORIES = [
@@ -285,7 +319,8 @@ function App() {
   const [newsError, setNewsError] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
-  const [section, setSection] = useState("store");
+  const [routePath, setRoutePath] = useState(() => window.location.pathname);
+  const [section, setSection] = useState(() => window.location.pathname === "/admin" ? "admin" : "store");
   const [activeMobileTab, setActiveMobileTab] = useState("home");
   const [search, setSearch] = useState("");
   const [activeCategory, setActiveCategory] = useState("Все");
@@ -296,7 +331,7 @@ function App() {
   const [sortBy, setSortBy] = useState("popular");
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [comparedIds, setComparedIds] = useState([]);
-  const [cart, setCart] = useState({});
+  const [cart, setCart] = useState(readStoredCart);
   const [cartOpen, setCartOpen] = useState(false);
   const [promoInput, setPromoInput] = useState("");
   const [appliedPromo, setAppliedPromo] = useState("");
@@ -318,16 +353,264 @@ function App() {
   const filterCurrencyLanguage = useRef(language);
   const [adminToken, setAdminToken] = useState(() => {
     try {
-      return window.localStorage.getItem("electromart-admin-token") || "";
+      return window.localStorage.getItem("admin_token") || window.localStorage.getItem("electromart-admin-token") || "";
     } catch {
       return "";
     }
   });
-  const [adminLoginOpen, setAdminLoginOpen] = useState(false);
   const [adminUsername, setAdminUsername] = useState("");
   const [adminPassword, setAdminPassword] = useState("");
   const [adminLoginError, setAdminLoginError] = useState("");
   const [adminLoginSubmitting, setAdminLoginSubmitting] = useState(false);
+  const [customerToken, setCustomerToken] = useState(() => {
+    try {
+      return window.localStorage.getItem("electromart_user_token") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [customer, setCustomer] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem("electromart_user");
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [customerLoginOpen, setCustomerLoginOpen] = useState(false);
+  const [customerAuthMode, setCustomerAuthMode] = useState("login");
+  const [customerPhone, setCustomerPhone] = useState("");
+  const [customerFirstName, setCustomerFirstName] = useState("");
+  const [customerPassword, setCustomerPassword] = useState("");
+  const [customerAuthError, setCustomerAuthError] = useState("");
+  const [customerAuthSubmitting, setCustomerAuthSubmitting] = useState(false);
+  const [cartSyncRetry, setCartSyncRetry] = useState(0);
+  const cartRef = useRef(cart);
+  const cartSyncReady = useRef(!customerToken);
+  const cartSyncQueue = useRef(Promise.resolve());
+  const currentCustomerToken = useRef(customerToken);
+  const currentCustomerId = useRef(customer?.id ? String(customer.id) : "");
+  const cartOwnerId = useRef(readStoredCartOwner());
+  const currentLanguage = useRef(language);
+  const cartMergeGeneration = useRef(0);
+  currentCustomerToken.current = customerToken;
+  currentCustomerId.current = customer?.id ? String(customer.id) : "";
+  currentLanguage.current = language;
+
+  const updateCart = useCallback((update) => {
+    const next = typeof update === "function" ? update(cartRef.current) : update;
+    const normalized = next && typeof next === "object" && !Array.isArray(next) ? next : {};
+    cartRef.current = normalized;
+    setCart(normalized);
+    try {
+      window.localStorage.setItem("electromart_cart", JSON.stringify(normalized));
+    } catch (error) {
+      console.error("Не удалось сохранить корзину в локальном хранилище:", error);
+    }
+  }, []);
+
+  const clearCustomerSession = useCallback(() => {
+    try {
+      window.localStorage.removeItem("electromart_user_token");
+      window.localStorage.removeItem("electromart_user");
+    } catch (error) {
+      console.error("Не удалось удалить локальный сеанс покупателя:", error);
+    }
+    setCustomerToken("");
+    setCustomer(null);
+    cartSyncReady.current = false;
+  }, []);
+
+  const queueCartSync = useCallback((token, snapshot, ownerId = currentCustomerId.current) => {
+    const operation = cartSyncQueue.current
+      .catch((error) => {
+        console.error("Предыдущая синхронизация корзины завершилась ошибкой:", error);
+      })
+      .then(async () => {
+        if (!token || token !== currentCustomerToken.current) return;
+        const items = Object.entries(snapshot)
+          .map(([productId, quantity]) => ({
+            product_id: Number(productId),
+            quantity: Math.floor(Number(quantity)),
+          }))
+          .filter((item) => Number.isInteger(item.product_id) && item.product_id > 0 && Number.isInteger(item.quantity) && item.quantity > 0);
+        const response = await fetch(`${API_URL}/api/users/me/cart`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(items),
+        });
+        if (response.status === 401 || response.status === 403) {
+          clearCustomerSession();
+          throw new Error(translate(currentLanguage.current, "Сеанс покупателя завершён. Войдите снова."));
+        }
+        if (!response.ok) {
+          const result = await response.json().catch(() => null);
+          throw new Error(result?.detail || `Cart synchronization failed (${response.status}).`);
+        }
+        if (ownerId && token === currentCustomerToken.current) {
+          cartOwnerId.current = String(ownerId);
+          try {
+            window.localStorage.setItem("electromart_cart_user_id", String(ownerId));
+          } catch (error) {
+            console.error("Не удалось сохранить владельца синхронизированной корзины:", error);
+          }
+        }
+        return response.json();
+      });
+    cartSyncQueue.current = operation;
+    operation.catch((error) => {
+      console.error("Не удалось синхронизировать корзину с сервером:", error);
+      setToast({ message: translate(currentLanguage.current, "Не удалось сохранить корзину на сервере. Проверьте подключение и повторите попытку."), type: "error" });
+    });
+    return operation;
+  }, [clearCustomerSession]);
+
+  const navigate = useCallback((path, replace = false) => {
+    const target = path || "/";
+    const destination = new URL(target, window.location.origin);
+    const route = destination.pathname;
+    if (`${window.location.pathname}${window.location.hash}` !== `${destination.pathname}${destination.hash}`) {
+      window.history[replace ? "replaceState" : "pushState"]({}, "", destination);
+    }
+    setRoutePath(route);
+    setSection(route === "/admin" ? "admin" : "store");
+    setActiveMobileTab(route === "/profile" ? "account" : "home");
+    if (destination.hash) {
+      window.setTimeout(() => document.getElementById(destination.hash.slice(1))?.scrollIntoView({ behavior: "smooth" }), 0);
+    } else {
+      window.scrollTo({ top: 0, behavior: "auto" });
+    }
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const path = window.location.pathname;
+      setRoutePath(path);
+      setSection(path === "/admin" ? "admin" : "store");
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    if (!customerToken) return undefined;
+    const controller = new AbortController();
+    fetch(`${API_URL}/api/users/me`, {
+      headers: { Authorization: `Bearer ${customerToken}` },
+      signal: controller.signal,
+    }).then(async (response) => {
+      if (response.status === 401 || response.status === 403) {
+        window.localStorage.removeItem("electromart_user_token");
+        window.localStorage.removeItem("electromart_user");
+        setCustomerToken("");
+        setCustomer(null);
+        return;
+      }
+      if (!response.ok) throw new Error(`Customer profile request failed: ${response.status}`);
+      const data = await response.json();
+      setCustomer(data);
+      window.localStorage.setItem("electromart_user", JSON.stringify(data));
+    }).catch((error) => {
+      if (error.name !== "AbortError") console.error("Не удалось проверить сеанс покупателя:", error);
+    });
+    return () => controller.abort();
+  }, [customerToken]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("electromart_cart", JSON.stringify(cart));
+    } catch (error) {
+      console.error("Не удалось сохранить корзину в локальном хранилище:", error);
+    }
+  }, [cart]);
+
+  useEffect(() => {
+    const token = customerToken;
+    const generation = ++cartMergeGeneration.current;
+    if (!token) {
+      cartSyncReady.current = false;
+      return undefined;
+    }
+
+    cartSyncReady.current = false;
+    const controller = new AbortController();
+    async function mergeSavedCart() {
+      try {
+        const response = await fetch(`${API_URL}/api/users/me/cart`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: controller.signal,
+        });
+        if (response.status === 401 || response.status === 403) {
+          clearCustomerSession();
+          return;
+        }
+        if (!response.ok) throw new Error(`Could not load saved cart (${response.status}).`);
+        const savedItems = await response.json();
+        if (!Array.isArray(savedItems)) throw new Error("The server returned an invalid saved cart.");
+        if (generation !== cartMergeGeneration.current || token !== currentCustomerToken.current) return;
+
+        const ownerMatches = cartOwnerId.current === String(customer?.id || "");
+        const includeLocalCart = !cartOwnerId.current || ownerMatches;
+        const merged = includeLocalCart ? { ...cartRef.current } : {};
+        for (const item of savedItems) {
+          const productId = Number(item?.product_id);
+          const savedQuantity = Math.floor(Number(item?.quantity));
+          if (!Number.isInteger(productId) || productId < 1 || !Number.isInteger(savedQuantity) || savedQuantity < 1) continue;
+          const localQuantity = includeLocalCart
+            ? Math.max(0, Math.floor(Number(cartRef.current[productId]) || 0))
+            : 0;
+          const productStock = Number(item?.product?.stock_count);
+          const combinedQuantity = ownerMatches
+            ? Math.max(localQuantity, savedQuantity)
+            : localQuantity + savedQuantity;
+          merged[productId] = Number.isFinite(productStock) && productStock > 0
+            ? Math.min(combinedQuantity, productStock)
+            : combinedQuantity;
+        }
+
+        updateCart(merged);
+        const mergedSnapshot = JSON.stringify(merged);
+        cartSyncReady.current = true;
+        await queueCartSync(token, merged, customer?.id);
+        if (generation !== cartMergeGeneration.current || token !== currentCustomerToken.current) return;
+        const latestCart = cartRef.current;
+        if (JSON.stringify(latestCart) !== mergedSnapshot) {
+          await queueCartSync(token, latestCart, customer?.id);
+        }
+      } catch (error) {
+        if (error.name !== "AbortError" && generation === cartMergeGeneration.current) {
+          console.error("Не удалось объединить корзину покупателя:", error);
+          setToast({ message: translate(currentLanguage.current, "Не удалось загрузить сохранённую корзину. Локальная корзина сохранена."), type: "error" });
+        }
+      }
+    }
+    mergeSavedCart();
+    return () => controller.abort();
+  }, [customerToken, customer?.id, cartSyncRetry, clearCustomerSession, queueCartSync, updateCart]);
+
+  useEffect(() => {
+    if (!customerToken || cartSyncReady.current) return undefined;
+    const retryMerge = () => setCartSyncRetry((attempt) => attempt + 1);
+    window.addEventListener("online", retryMerge);
+    window.addEventListener("focus", retryMerge);
+    return () => {
+      window.removeEventListener("online", retryMerge);
+      window.removeEventListener("focus", retryMerge);
+    };
+  }, [customerToken, cartSyncRetry]);
+
+  useEffect(() => {
+    if (!customerToken || !cartSyncReady.current) return undefined;
+    const token = customerToken;
+    const snapshot = { ...cart };
+    const timer = window.setTimeout(() => {
+      queueCartSync(token, snapshot, currentCustomerId.current).catch(() => {});
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [cart, customerToken, queueCartSync]);
 
   useEffect(() => {
     const previousLanguage = filterCurrencyLanguage.current;
@@ -359,7 +642,7 @@ function App() {
       setLoading(true);
       setLoadError("");
       try {
-        const response = await fetch(`${API_BASE}/api/products`, { signal: controller.signal });
+        const response = await fetch(`${API_URL}/api/products`, { signal: controller.signal });
         if (!response.ok) {
           throw new Error(`Сервер ответил с ошибкой ${response.status}`);
         }
@@ -387,7 +670,7 @@ function App() {
     const controller = new AbortController();
     async function loadPromotions() {
       try {
-        const response = await fetch(`${API_BASE}/api/promotions`, { signal: controller.signal });
+        const response = await fetch(`${API_URL}/api/promotions`, { signal: controller.signal });
         if (!response.ok) throw new Error(`Сервер ответил с ошибкой ${response.status}`);
         const data = await response.json();
         if (!Array.isArray(data)) throw new Error("Список акций получен в неверном формате.");
@@ -408,7 +691,7 @@ function App() {
     const controller = new AbortController();
     async function loadNews() {
       try {
-        const response = await fetch(`${API_BASE}/api/news`, { signal: controller.signal });
+        const response = await fetch(`${API_URL}/api/news`, { signal: controller.signal });
         if (!response.ok) throw new Error(`Сервер ответил с ошибкой ${response.status}`);
         const data = await response.json();
         if (!Array.isArray(data)) throw new Error("Список новостей получен в неверном формате.");
@@ -533,35 +816,24 @@ function App() {
   const notify = (message, type = "success") => setToast({ message: translate(language, message), type });
   const hideToast = () => setToast(null);
 
-  function openAdminPanel() {
-    setActiveMobileTab("account");
-    if (adminToken) {
-      setAdminLoginOpen(false);
-      setSection("admin");
-      return;
-    }
-    setAdminLoginError("");
-    setAdminLoginOpen(true);
-  }
-
   const handleAdminUnauthorized = useCallback(() => {
     try {
+      window.localStorage.removeItem("admin_token");
       window.localStorage.removeItem("electromart-admin-token");
     } catch (error) {
       console.error("Не удалось удалить токен администратора:", error);
     }
     setAdminToken("");
-    setSection("store");
+    navigate("/admin");
     setAdminLoginError(translate(language, "Сеанс администратора завершён. Войдите снова."));
-    setAdminLoginOpen(true);
-  }, [language]);
+  }, [language, navigate]);
 
   async function submitAdminLogin(event) {
     event.preventDefault();
     setAdminLoginSubmitting(true);
     setAdminLoginError("");
     try {
-      const response = await fetch(`${API_BASE}/api/admin/login`, {
+      const response = await fetch(`${API_URL}/api/admin/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: adminUsername, password: adminPassword }),
@@ -571,14 +843,14 @@ function App() {
         throw new Error(translate(language, result?.detail || "Не удалось выполнить вход."));
       }
       try {
+        window.localStorage.setItem("admin_token", result.token);
         window.localStorage.setItem("electromart-admin-token", result.token);
       } catch (error) {
         throw new Error(translate(language, "Не удалось сохранить сеанс администратора в этом браузере."));
       }
       setAdminToken(result.token);
       setAdminPassword("");
-      setAdminLoginOpen(false);
-      setSection("admin");
+      navigate("/admin");
     } catch (error) {
       setAdminLoginError(error.message || translate(language, "Не удалось подключиться к серверу."));
     } finally {
@@ -588,14 +860,94 @@ function App() {
 
   function logoutAdmin() {
     try {
+      window.localStorage.removeItem("admin_token");
       window.localStorage.removeItem("electromart-admin-token");
     } catch (error) {
       console.error("Не удалось удалить токен администратора:", error);
     }
     setAdminToken("");
-    setSection("store");
+    navigate("/");
     setActiveMobileTab("home");
   }
+
+  const updateCustomerProfile = useCallback((nextCustomer) => {
+    setCustomer(nextCustomer);
+    try {
+      window.localStorage.setItem("electromart_user", JSON.stringify(nextCustomer));
+    } catch (error) {
+      console.error("Не удалось сохранить профиль покупателя:", error);
+    }
+  }, []);
+
+  const logoutCustomer = useCallback(() => {
+    try {
+      window.localStorage.removeItem("electromart_user_token");
+      window.localStorage.removeItem("electromart_user");
+    } catch (error) {
+      console.error("Не удалось завершить сеанс покупателя:", error);
+    }
+    setCustomerToken("");
+    setCustomer(null);
+    setCustomerLoginOpen(false);
+    navigate("/");
+  }, [navigate]);
+
+  async function submitCustomerAuth(event) {
+    event.preventDefault();
+    setCustomerAuthSubmitting(true);
+    setCustomerAuthError("");
+    try {
+      const phone = `+998${customerPhone.replace(/\D/g, "").slice(0, 9)}`;
+      const registering = customerAuthMode === "register";
+      const response = await fetch(`${API_URL}/api/auth/${registering ? "register" : "login"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          phone,
+          password: customerPassword,
+          ...(registering ? { first_name: customerFirstName.trim() } : {}),
+        }),
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.user_token || !result?.user) {
+        throw new Error(result?.detail || translate(language, "Не удалось выполнить вход."));
+      }
+      window.localStorage.setItem("electromart_user_token", result.user_token);
+      window.localStorage.setItem("electromart_user", JSON.stringify(result.user));
+      setCustomerToken(result.user_token);
+      setCustomer(result.user);
+      setCustomerPassword("");
+      setCustomerLoginOpen(false);
+      setCheckoutName([result.user.first_name, result.user.last_name].filter(Boolean).join(" "));
+      setCheckoutPhoneCountry("uz");
+      setCheckoutPhone(result.user.phone.replace(/^\+998/, "").slice(0, 9));
+      notify(registering ? "Регистрация прошла успешно." : "Вы вошли в аккаунт.");
+      if (routePath === "/profile") navigate("/profile");
+    } catch (error) {
+      setCustomerAuthError(error.message || translate(language, "Не удалось подключиться к серверу."));
+    } finally {
+      setCustomerAuthSubmitting(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!customer) return;
+    setCheckoutName([customer.first_name, customer.last_name].filter(Boolean).join(" "));
+    setQuickName([customer.first_name, customer.last_name].filter(Boolean).join(" "));
+    if (customer.phone?.startsWith("+998")) {
+      setCheckoutPhoneCountry("uz");
+      setCheckoutPhone(customer.phone.slice(4, 13));
+      setQuickPhoneCountry("uz");
+      setQuickPhone(customer.phone.slice(4, 13));
+    }
+  }, [customer]);
+
+  useEffect(() => {
+    if (routePath === "/profile" && !customerToken) {
+      setCustomerAuthMode("login");
+      setCustomerLoginOpen(true);
+    }
+  }, [customerToken, routePath]);
 
   function openCart() {
     setCompareOpen(false);
@@ -611,7 +963,7 @@ function App() {
       notify("Этого товара сейчас нет в наличии.", "error");
       return;
     }
-    setCart((current) => ({
+    updateCart((current) => ({
       ...current,
       [product.id]: Math.min((current[product.id] || 0) + 1, product.stock_count),
     }));
@@ -619,7 +971,7 @@ function App() {
   }
 
   function changeQuantity(product, change) {
-    setCart((current) => {
+    updateCart((current) => {
       const nextQuantity = (current[product.id] || 0) + change;
       if (nextQuantity <= 0) {
         const updated = { ...current };
@@ -646,9 +998,12 @@ function App() {
   async function sendOrder({ name, phone, address, items, total, orderDetails }) {
     setSubmitting(true);
     try {
-      const response = await fetch(`${API_BASE}/api/orders`, {
+      const response = await fetch(`${API_URL}/api/orders`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(customerToken ? { Authorization: `Bearer ${customerToken}` } : {}),
+        },
         body: JSON.stringify({
           customer_name: name.trim(),
           phone: phone.trim(),
@@ -715,7 +1070,7 @@ function App() {
     });
     if (order) {
       setCheckoutConfirmation({ orderId: order.id, total: finalTotal });
-      setCart({});
+      updateCart({});
       setCheckoutName("");
       setCheckoutPhone("");
       setCheckoutPhoneCountry(defaultPhoneCountry(language));
@@ -737,6 +1092,7 @@ function App() {
   }
 
   function showPromoProducts() {
+    if (routePath !== "/") navigate("/");
     setSection("store");
     setSearch("");
     setActiveCategory("Все");
@@ -762,14 +1118,24 @@ function App() {
   }
 
   function navigateHome() {
-    setSection("store");
+    navigate("/");
     resetFilters();
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function navigateCatalog() {
-    setSection("store");
+    navigate("/");
     setMobileCatalogOpen(true);
+  }
+
+  function openCustomerAccount() {
+    if (customer) {
+      navigate("/profile");
+      return;
+    }
+    setCustomerAuthMode("login");
+    setCustomerAuthError("");
+    setCustomerLoginOpen(true);
   }
 
   return (
@@ -783,7 +1149,7 @@ function App() {
             className="brand-logo"
             aria-label="ElectroMart — на главную"
             onClick={() => {
-              setSection("store");
+              navigate("/");
               resetFilters();
             }}
           >
@@ -804,7 +1170,7 @@ function App() {
               value={search}
               onChange={(event) => {
                 setSearch(event.target.value);
-                setSection("store");
+                if (routePath !== "/") navigate("/");
               }}
             />
             <kbd>⌘ K</kbd>
@@ -835,27 +1201,18 @@ function App() {
                 <small>{formatPrice(finalTotal, language)}</small>
               </span>
             </button>
-            <button
-              className="admin-toggle"
-              onClick={() => section === "admin" ? setSection("store") : openAdminPanel()}
-            >
-              {section === "store" ? "Админ-панель" : "В магазин"}
-              <ArrowRight size={16} />
+            <button className="header-action customer-account-button" onClick={openCustomerAccount}>
+              <span className="header-action-icon"><UserRound size={20} /></span>
+              <span>{customer?.first_name || translate(language, "Войти")}</span>
             </button>
           </div>
         </div>
         <nav className="top-nav page-width" aria-label="Основная навигация">
           <button
             className={`nav-tab ${section === "store" ? "nav-tab-active" : ""}`}
-            onClick={() => setSection("store")}
+            onClick={() => navigate("/")}
           >
             Витрина магазина
-          </button>
-          <button
-            className={`nav-tab ${section === "admin" ? "nav-tab-active" : ""}`}
-            onClick={openAdminPanel}
-          >
-            Панель управления (Admin)
           </button>
           <span className="nav-note">
             <span className="status-dot" /> Работаем ежедневно, 09:00–21:00
@@ -863,7 +1220,26 @@ function App() {
         </nav>
       </header>
 
-      {section === "store" ? (
+      {routePath === "/profile" ? (
+        customerToken && customer ? (
+          <ProfilePage
+            user={customer}
+            token={customerToken}
+            language={language}
+            onUserUpdated={updateCustomerProfile}
+            onLogout={logoutCustomer}
+            onNavigate={navigate}
+            onLanguageChange={setLanguage}
+          />
+        ) : (
+          <main className="profile-auth-required page-width">
+            <UserRound size={32} />
+            <h1>{translate(language, "Войдите, чтобы открыть профиль")}</h1>
+            <p>{translate(language, "Войдите или зарегистрируйтесь, чтобы видеть свои заказы и данные профиля.")}</p>
+            <button className="primary-button" onClick={openCustomerAccount}>{translate(language, "Войти")}</button>
+          </main>
+        )
+      ) : section === "store" ? (
         <main>
           <section className="promotions-section page-width" aria-label="Текущие акции">
             {featuredPromotion ? (
@@ -1208,7 +1584,7 @@ function App() {
             <span className="promise-rating"><Star size={16} fill="currentColor" /> 4,9 / 5 по отзывам клиентов</span>
           </section>
         </main>
-      ) : (
+      ) : adminToken ? (
         <AdminPanel
           initialProducts={products}
           onProductsChange={setProducts}
@@ -1220,6 +1596,23 @@ function App() {
           onUnauthorized={handleAdminUnauthorized}
           onLogout={logoutAdmin}
         />
+      ) : (
+        <main className="admin-login-page page-width">
+          <div className="admin-login-card">
+            <span className="admin-login-icon"><KeyRound size={24} /></span>
+            <span className="section-eyebrow">{translate(language, "ЗАЩИЩЁННЫЙ ДОСТУП")}</span>
+            <h1>{translate(language, "Вход администратора")}</h1>
+            <p>{translate(language, "Введите учётные данные владельца магазина для доступа к панели управления.")}</p>
+            <form className="admin-login-form" onSubmit={submitAdminLogin}>
+              <label>{translate(language, "Имя пользователя")}<input autoComplete="username" required maxLength={128} value={adminUsername} onChange={(event) => setAdminUsername(event.target.value)} /></label>
+              <label>{translate(language, "Пароль")}<input type="password" autoComplete="current-password" required maxLength={256} value={adminPassword} onChange={(event) => setAdminPassword(event.target.value)} /></label>
+              {adminLoginError && <p className="admin-login-error" role="alert">{adminLoginError}</p>}
+              <button className="primary-button checkout-button" type="submit" disabled={adminLoginSubmitting}>
+                {adminLoginSubmitting ? translate(language, "Проверяем данные…") : <><KeyRound size={16} /> {translate(language, "Войти")}</>}
+              </button>
+            </form>
+          </div>
+        </main>
       )}
 
       <footer className="site-footer">
@@ -1229,23 +1622,20 @@ function App() {
         </div>
       </footer>
 
-      <nav className="mobile-bottom-nav" aria-label="Мобильная навигация">
+      {routePath !== "/admin" && <nav className="mobile-bottom-nav" aria-label="Мобильная навигация">
         <button className={activeMobileTab === "home" ? "mobile-nav-active" : ""} onClick={() => { setActiveMobileTab("home"); navigateHome(); }}>
           <Home size={19} /><span>Главная</span>
         </button>
         <button className={activeMobileTab === "catalog" ? "mobile-nav-active" : ""} onClick={() => { setActiveMobileTab("catalog"); navigateCatalog(); }}>
           <LayoutGrid size={19} /><span>Каталог</span>
         </button>
-        <button className={activeMobileTab === "promotions" ? "mobile-nav-active" : ""} onClick={() => { setActiveMobileTab("promotions"); showPromoProducts(); }}>
-          <Tag size={19} /><span>Акции</span>
-        </button>
         <button className={`mobile-nav-cart ${activeMobileTab === "cart" ? "mobile-nav-active" : ""}`} onClick={() => { setActiveMobileTab("cart"); openCart(); }}>
           <ShoppingCart size={19} />{cartCount > 0 && <b>{cartCount}</b>}<span>Корзина</span>
         </button>
-        <button className={activeMobileTab === "account" ? "mobile-nav-active" : ""} onClick={() => { if (section === "admin") { setSection("store"); setActiveMobileTab("home"); } else openAdminPanel(); }}>
-          <UserRound size={19} /><span>Кабинет</span>
+        <button className={activeMobileTab === "account" ? "mobile-nav-active" : ""} onClick={openCustomerAccount}>
+          <UserRound size={19} /><span>{customer?.first_name || "Профиль"}</span>
         </button>
-      </nav>
+      </nav>}
 
       {mobileCatalogOpen && (
         <div className="mobile-catalog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setMobileCatalogOpen(false)}>
@@ -1407,7 +1797,7 @@ function App() {
                           <button aria-label="Увеличить количество" disabled={quantity >= product.stock_count} onClick={() => changeQuantity(product, 1)}><Plus size={14} /></button>
                         </div>
                       </div>
-                      <button className="remove-cart-item" aria-label="Удалить из корзины" onClick={() => setCart((current) => { const updated = { ...current }; delete updated[product.id]; return updated; })}><X size={16} /></button>
+                      <button className="remove-cart-item" aria-label="Удалить из корзины" onClick={() => updateCart((current) => { const updated = { ...current }; delete updated[product.id]; return updated; })}><X size={16} /></button>
                     </div>
                   ))}
                 </div>
@@ -1503,7 +1893,7 @@ function App() {
         </Modal>
       )}
 
-      {section === "store" && <CustomerSupportChat />}
+      {section === "store" && routePath !== "/profile" && <CustomerSupportChat />}
 
       {selectedArticle && (
         <Modal title="Журнал ElectroMart" onClose={() => setSelectedArticle(null)} wide>
@@ -1520,34 +1910,31 @@ function App() {
         </Modal>
       )}
 
-      {adminLoginOpen && (
-        <Modal title="Вход в панель администратора" onClose={() => setAdminLoginOpen(false)}>
-          <form className="admin-login-form" onSubmit={submitAdminLogin}>
-            <p>Введите учётные данные администратора для доступа к заказам и настройкам магазина.</p>
-            <label>
-              Имя пользователя
+      {customerLoginOpen && (
+        <Modal title={customerAuthMode === "register" ? "Создать аккаунт" : "Войти"} onClose={() => setCustomerLoginOpen(false)}>
+          <form className="customer-auth-form" onSubmit={submitCustomerAuth}>
+            <div className="customer-auth-switch">
+              <button type="button" className={customerAuthMode === "login" ? "active" : ""} onClick={() => { setCustomerAuthMode("login"); setCustomerAuthError(""); }}>Войти</button>
+              <button type="button" className={customerAuthMode === "register" ? "active" : ""} onClick={() => { setCustomerAuthMode("register"); setCustomerAuthError(""); }}>Зарегистрироваться</button>
+            </div>
+            {customerAuthMode === "register" && (
+              <label>Имя<input value={customerFirstName} onChange={(event) => setCustomerFirstName(event.target.value)} required maxLength={100} autoComplete="given-name" /></label>
+            )}
+            <label>Номер телефона
               <input
-                autoComplete="username"
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                value={`+998 ${formatPhoneDigits(customerPhone, PHONE_COUNTRIES[0])}`}
+                onChange={(event) => setCustomerPhone(event.target.value.replace(/\D/g, "").replace(/^998/, "").slice(0, 9))}
+                placeholder="+998 00 000-00-00"
                 required
-                maxLength={128}
-                value={adminUsername}
-                onChange={(event) => setAdminUsername(event.target.value)}
               />
             </label>
-            <label>
-              Пароль
-              <input
-                type="password"
-                autoComplete="current-password"
-                required
-                maxLength={256}
-                value={adminPassword}
-                onChange={(event) => setAdminPassword(event.target.value)}
-              />
-            </label>
-            {adminLoginError && <p className="admin-login-error" role="alert">{adminLoginError}</p>}
-            <button className="primary-button checkout-button" type="submit" disabled={adminLoginSubmitting}>
-              {adminLoginSubmitting ? "Проверяем данные…" : <><KeyRound size={16} /> Войти</>}
+            <label>Пароль<input type="password" value={customerPassword} onChange={(event) => setCustomerPassword(event.target.value)} required minLength={8} maxLength={128} autoComplete={customerAuthMode === "register" ? "new-password" : "current-password"} /></label>
+            {customerAuthError && <p className="admin-login-error" role="alert">{customerAuthError}</p>}
+            <button className="primary-button checkout-button" type="submit" disabled={customerAuthSubmitting}>
+              {customerAuthSubmitting ? "Подождите…" : customerAuthMode === "register" ? "Создать аккаунт" : "Войти"}
             </button>
           </form>
         </Modal>
@@ -1893,6 +2280,22 @@ const styles = `
   .admin-login-form input{height:42px;width:100%;padding:0 12px;border:1px solid #e3e8f0;border-radius:9px;outline:none;background:white;color:#263650;font:inherit}
   .admin-login-form input:focus{border-color:#91acf0;box-shadow:0 0 0 3px #2c63e711}
   .admin-login-form .admin-login-error{padding:9px 10px;border:1px solid #f1d8da;border-radius:8px;background:#fff7f7;color:#b9505a}
+  .customer-auth-form{display:grid;gap:12px}
+  .customer-auth-form>label{display:grid;gap:6px;color:#53617a;font-size:11px;font-weight:650}
+  .customer-auth-form input{height:42px;width:100%;padding:0 12px;border:1px solid #e3e8f0;border-radius:9px;outline:none;background:white;color:#263650;font:inherit}
+  .customer-auth-form input:focus{border-color:#91acf0;box-shadow:0 0 0 3px #2c63e711}
+  .customer-auth-switch{display:grid;grid-template-columns:1fr 1fr;gap:5px;padding:4px;border-radius:10px;background:#f2f4f8}
+  .customer-auth-switch button{min-height:37px;padding:7px;border:0;border-radius:7px;background:transparent;color:#68758a;font:inherit;font-size:10px;font-weight:650}
+  .customer-auth-switch button.active{background:white;color:#315ec6;box-shadow:0 2px 7px #26365012}
+  .admin-login-page,.profile-auth-required{min-height:calc(100vh - 185px);display:flex;align-items:center;justify-content:center;padding:35px 18px}
+  .admin-login-card{width:min(440px,100%);padding:30px;border:1px solid #e7ebf2;border-radius:18px;background:white;box-shadow:0 16px 50px #192c4b12}
+  .admin-login-card .admin-login-icon{width:48px;height:48px;display:grid;place-items:center;margin-bottom:16px;border-radius:14px;background:#eef3ff;color:#4567ce}
+  .admin-login-card h1{margin:8px 0;color:#25344f;font-size:25px}
+  .admin-login-card>p{margin:0 0 20px;color:#77849a;font-size:12px;line-height:1.7}
+  .profile-auth-required{flex-direction:column;text-align:center;color:#4567ce}
+  .profile-auth-required h1{margin:14px 0 5px;color:#25344f;font-size:23px}
+  .profile-auth-required p{max-width:440px;color:#77849a;font-size:12px;line-height:1.7}
+  .profile-auth-required .primary-button{margin-top:9px;padding:0 22px}
   .checkout-form input,.quick-form input{width:100%;height:38px;padding:0 11px;border:1px solid #e3e8f0;border-radius:8px;outline:none;background:white;color:#263650;font-size:10px}
   .checkout-form input:focus,.quick-form input:focus{border-color:#91acf0;box-shadow:0 0 0 3px #2c63e711}
   .checkout-form input::placeholder,.quick-form input::placeholder{color:#abb3c0}
@@ -2084,7 +2487,7 @@ const styles = `
   .mobile-nav-active{color:#5b2ab9!important}
   .mobile-cart-sticky{display:none}
   @media(max-width:850px){.promotion-banner{padding:24px;min-height:180px}.promotion-copy{max-width:57%}.promotion-copy h2{font-size:20px}.promotion-offer{min-width:195px;padding:13px}.news-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.news-card-image{height:155px}.article-modal-image{height:235px}}
-  @media(max-width:767px){body{padding-bottom:calc(66px + env(safe-area-inset-bottom))}.top-nav{display:none}.mobile-bottom-nav{position:fixed;z-index:30;right:0;bottom:0;left:0;min-height:62px;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));padding:6px 6px calc(6px + env(safe-area-inset-bottom));border-top:1px solid #e7eaf1;background:#fffffffa;box-shadow:0 -4px 16px #1c31520d;backdrop-filter:blur(14px)}.mobile-bottom-nav button{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border:0;background:transparent;color:#7e899e;font-size:7px;font-weight:700}.mobile-bottom-nav button svg{stroke-width:1.8}.mobile-bottom-nav button.mobile-nav-active{color:#5530ba}.mobile-bottom-nav button.mobile-nav-active:before{content:"";position:absolute;top:-6px;width:25px;height:2px;border-radius:2px;background:#753ced}.mobile-bottom-nav .mobile-nav-cart b{position:absolute;top:1px;left:calc(50% + 3px);min-width:15px;height:15px;display:grid;place-items:center;padding:0 3px;border:1px solid white;border-radius:99px;background:#ef4e61;color:white;font-size:7px}.customer-chat-root{bottom:calc(75px + env(safe-area-inset-bottom))}.customer-chat-window{bottom:55px}.site-footer{padding-bottom:8px}.mobile-catalog-sheet{padding-bottom:env(safe-area-inset-bottom)}}
+  @media(max-width:767px){body{padding-bottom:calc(66px + env(safe-area-inset-bottom))}.top-nav{display:none}.mobile-bottom-nav{position:fixed;z-index:30;right:0;bottom:0;left:0;min-height:62px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));padding:6px 6px calc(6px + env(safe-area-inset-bottom));border-top:1px solid #e7eaf1;background:#fffffffa;box-shadow:0 -4px 16px #1c31520d;backdrop-filter:blur(14px)}.mobile-bottom-nav button{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border:0;background:transparent;color:#7e899e;font-size:7px;font-weight:700}.mobile-bottom-nav button svg{stroke-width:1.8}.mobile-bottom-nav button.mobile-nav-active{color:#5530ba}.mobile-bottom-nav button.mobile-nav-active:before{content:"";position:absolute;top:-6px;width:25px;height:2px;border-radius:2px;background:#753ced}.mobile-bottom-nav .mobile-nav-cart b{position:absolute;top:1px;left:calc(50% + 3px);min-width:15px;height:15px;display:grid;place-items:center;padding:0 3px;border:1px solid white;border-radius:99px;background:#ef4e61;color:white;font-size:7px}.customer-chat-root{bottom:calc(75px + env(safe-area-inset-bottom))}.customer-chat-window{bottom:55px}.site-footer{padding-bottom:8px}.mobile-catalog-sheet{padding-bottom:env(safe-area-inset-bottom)}}
   @media(max-width:600px){.header-actions{width:100%;order:4;justify-content:space-between;gap:7px}.pwa-install-button{width:auto;height:32px;justify-content:center;padding:0 6px;font-size:7px}.pwa-install-label-full{display:none}.pwa-install-label-short{display:inline!important}.language-switcher{padding:2px}.language-switcher button{min-width:25px;height:24px;padding:0 5px}.header-action{padding:4px}.admin-toggle{height:32px;padding:0 8px}.header-actions .admin-toggle{font-size:8px}.header-main{gap:9px}.brand-logo{margin-right:auto}.search-box{order:3;flex:1 0 100%}.mobile-chat-trigger{display:none}}
   .pwa-install-label-short{display:none}
   @media(max-width:600px){.promotions-section{padding-top:12px}.promotion-banner{min-height:0;align-items:flex-start;gap:8px;padding:18px 14px;border-radius:14px}.promotion-copy{max-width:none;flex:1}.promotion-kicker{max-width:230px;font-size:6px;line-height:1.5;letter-spacing:.7px}.promotion-copy h2{max-width:245px;margin:9px 0 5px;font-size:16px}.promotion-copy p{max-width:245px;font-size:8px}.promotion-button{gap:5px;margin-top:11px;padding:9px;font-size:7px}.promotion-button svg{width:13px}.promotion-offer{min-width:0;width:114px;flex:0 0 114px;padding:11px 6px;margin-top:7px;border-radius:10px}.promotion-discount{font-size:19px}.promotion-offer-caption{font-size:6px}.promotion-ends{margin:9px 0 5px;font-size:6px}.promotion-ends svg{width:11px}.countdown{gap:3px}.countdown-unit{width:31px;padding:5px 2px}.countdown-unit strong{font-size:12px}.countdown-unit small{font-size:5px}.promotion-date{font-size:5px}.promotion-spark-one{right:33%;top:9px;font-size:14px}.promotion-spark-two{right:3%;bottom:7px;font-size:19px}.secondary-promotions{gap:6px;margin-top:7px}.secondary-promotion{min-height:66px;gap:5px;padding:9px;border-radius:9px}.secondary-promotion strong{font-size:7px}.secondary-promotion small{font-size:6px}.secondary-promotion>div>span{font-size:7px}.secondary-promotion button{width:25px;height:25px;flex-basis:25px}.news-section{padding:6px 0 30px}.news-heading{gap:8px}.news-heading-note{font-size:7px}.news-grid{gap:8px}.news-card-image{height:112px}.news-card-body{padding:9px}.news-card h3{height:31px;font-size:8px}.news-card p{font-size:7px;height:36px}.news-card-body>button{margin-top:7px;font-size:7px}.news-date{font-size:7px}.news-card-image .news-date{left:6px;bottom:6px;padding:5px 6px}.article-modal{grid-template-columns:1fr;gap:13px}.article-modal-image{height:190px}.article-modal-copy h2{font-size:16px}.article-content,.article-summary{font-size:9px}.cart-drawer{width:100%;max-height:100dvh}.cart-items-list{min-height:90px;padding:4px 15px}.cart-item{grid-template-columns:61px 1fr 22px;gap:9px;padding:11px 0}.cart-item-image{width:61px;height:61px}.cart-item-info>strong{font-size:8px}.checkout-form{max-height:64dvh;overflow-y:auto;padding:12px 15px 16px}.checkout-form label{margin-top:7px}.checkout-form input,.payment-select{height:35px}.promo-code-form{margin-bottom:9px}.promo-code-controls input{height:33px}.checkout-confirmation{min-height:65vh;padding:24px}}
